@@ -218,18 +218,35 @@ def spot_metadata(stocks, errors):
     # 对缺失项用 Yahoo 元数据回退，
     # 并控制并发，避免一次失败影响整个股票池。
     fundamental_keys = ("roe", "profit_margin", "debt_to_equity", "revenue_growth",
-        "earnings_growth", "trailing_pe", "price_to_book", "beta")
+        "earnings_growth", "trailing_pe", "forward_pe", "static_pe",
+        "net_profit_ttm", "price_to_book", "beta")
     missing = [x for x in stocks if x.get("n") == x["c"] or
         not x.get("market_cap") or (x["m"] == "A股" and not x.get("float_cap")) or
-        sum(x.get(key) is not None for key in fundamental_keys) < 5]
+        sum(x.get(key) is not None for key in fundamental_keys) < 5 or
+        all(x.get(key) is None for key in ("net_profit_ttm", "static_pe", "forward_pe"))]
 
     def load_one(item):
-        info = yf.Ticker(item["yf"]).get_info()
+        ticker = yf.Ticker(item["yf"])
+        info = ticker.get_info()
         name = info.get("longName") or info.get("shortName")
         total = finite(info.get("marketCap"))
         float_shares = finite(info.get("floatShares"))
         shares = finite(info.get("sharesOutstanding"))
         float_cap = total * float_shares / shares if total and float_shares and shares else None
+        annual_net_income = None
+        try:
+            statement = ticker.get_income_stmt(freq="yearly")
+            for row_name in ("Net Income", "NetIncome", "Net Income Common Stockholders"):
+                if row_name in statement.index:
+                    values = statement.loc[row_name].dropna()
+                    if len(values):
+                        annual_net_income = finite(values.iloc[0])
+                        break
+        except Exception:
+            pass
+        net_profit_ttm = finite(info.get("netIncomeToCommon"))
+        same_currency = not info.get("financialCurrency") or not info.get("currency") or info.get("financialCurrency") == info.get("currency")
+        static_pe = total / annual_net_income if same_currency and total and annual_net_income and annual_net_income > 0 else None
         factors = {
             "roe": finite(info.get("returnOnEquity")),
             "profit_margin": finite(info.get("profitMargins")),
@@ -237,6 +254,11 @@ def spot_metadata(stocks, errors):
             "revenue_growth": finite(info.get("revenueGrowth")),
             "earnings_growth": finite(info.get("earningsGrowth")),
             "trailing_pe": finite(info.get("trailingPE")),
+            "forward_pe": finite(info.get("forwardPE")),
+            "static_pe": finite(static_pe),
+            "net_profit_ttm": net_profit_ttm,
+            "annual_net_income": annual_net_income,
+            "financial_currency": info.get("financialCurrency") or info.get("currency"),
             "price_to_book": finite(info.get("priceToBook")),
             "beta": finite(info.get("beta")),
             "free_cashflow": finite(info.get("freeCashflow")),
@@ -389,6 +411,7 @@ def rescore(stocks):
         "revenue_growth": (True, None), "earnings_growth": (True, None),
         "momentum_6m": (True, None),
         "trailing_pe": (False, lambda x: x > 0),
+        "forward_pe": (False, lambda x: x > 0),
         "price_to_book": (False, lambda x: x > 0),
         "volatility_60d": (False, lambda x: x >= 0),
         "drawdown_1y": (True, lambda x: x <= 0),
@@ -399,7 +422,7 @@ def rescore(stocks):
     groups = {
         "q": ["roe", "profit_margin", "debt_to_equity"],
         "g": ["revenue_growth", "earnings_growth", "momentum_6m"],
-        "v": ["trailing_pe", "price_to_book"],
+        "v": ["trailing_pe", "forward_pe", "price_to_book"],
         "r": ["volatility_60d", "drawdown_1y", "beta"],
     }
     for item in stocks:
@@ -432,6 +455,7 @@ def main():
         for field in ("n", "name_zh", "p", "price_value", "chg", "price_date", "fb", "fr", "f20",
                 "margin_date", "market_cap", "float_cap", "roe", "profit_margin",
                 "debt_to_equity", "revenue_growth", "earnings_growth", "trailing_pe",
+                "forward_pe", "static_pe", "net_profit_ttm", "annual_net_income", "financial_currency",
                 "price_to_book", "beta", "free_cashflow", "momentum_6m",
                 "volatility_60d", "drawdown_1y"):
             if field in old:
