@@ -17,6 +17,7 @@ import yfinance as yf
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "data" / "stocks.json"
+NAME_CACHE = ROOT / "data" / "name_zh.json"
 
 BASE = [
     dict(m="A股", c="300308", yf="300308.SZ", n="中际旭创", s="AI硬件", sub="光模块", score=91.8, q=92, g=96, v=72, r=86, grade="S", t="高速光模块需求与产品迭代构成核心增长驱动，盈利质量较强。", risk="客户集中度与海外需求波动仍需持续跟踪。"),
@@ -104,6 +105,18 @@ def finite(value):
 def load_previous():
     if not OUTPUT.exists():
         return {}
+
+
+def apply_name_cache(stocks):
+    try:
+        names = json.loads(NAME_CACHE.read_text(encoding="utf-8"))
+    except Exception:
+        names = {}
+    for item in stocks:
+        name = names.get(item["m"] + ":" + item["c"])
+        if name:
+            item["name_zh"] = name
+            item["n"] = name
     try:
         payload = json.loads(OUTPUT.read_text(encoding="utf-8"))
         return {x["c"]: x for x in payload.get("stocks", [])}
@@ -234,7 +247,7 @@ def spot_metadata(stocks, errors):
             for future in as_completed(futures):
                 try:
                     item, name, total, float_cap, factors = future.result()
-                    if name:
+                    if name and not item.get("name_zh") and (not item.get("n") or item.get("n") == item["c"]):
                         item["n"] = str(name).strip()
                     if total:
                         item["market_cap"] = total
@@ -275,7 +288,8 @@ def tencent_names(stocks, errors):
                 item = query_map.get(key.lower())
                 parts = body.split("~")
                 if item and len(parts) > 1 and parts[1].strip():
-                    item["n"] = parts[1].strip()
+                    item["name_zh"] = parts[1].strip()
+                    item["n"] = item["name_zh"]
         except Exception:
             failures += 1
     if failures:
@@ -409,15 +423,16 @@ def rescore(stocks):
 def main():
     previous = load_previous()
     stocks = expanded_base()
+    apply_name_cache(stocks)
     for item in stocks:
         old = previous.get(item["c"], {})
-        for field in ("n", "p", "price_value", "chg", "price_date", "fb", "fr", "f20",
+        for field in ("n", "name_zh", "p", "price_value", "chg", "price_date", "fb", "fr", "f20",
                 "margin_date", "market_cap", "float_cap", "roe", "profit_margin",
                 "debt_to_equity", "revenue_growth", "earnings_growth", "trailing_pe",
                 "price_to_book", "beta", "free_cashflow", "momentum_6m",
                 "volatility_60d", "drawdown_1y"):
             if field in old:
-                if field != "n" or old[field] != item["c"]:
+                if field != "n" or (not item.get("name_zh") and old[field] != item["c"]):
                     item[field] = old[field]
     errors = []
     float_caps = spot_metadata(stocks, errors)
