@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
@@ -11,6 +12,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import akshare as ak
+import requests
 import yfinance as yf
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -185,7 +187,11 @@ def spot_metadata(stocks, errors):
                                 float_caps[item["c"]] = cap
         except Exception as exc:
             errors.append(f"{market} metadata: {type(exc).__name__}")
-    # GitHub 云端偶尔无法访问东方财富。对缺失项用 Yahoo 元数据回退，
+    # GitHub 云端偶尔无法访问东方财富。腾讯行情用于补中文简称，
+    # Yahoo 只补仍缺失的名称和市值，不覆盖已取得的中文名。
+    tencent_names(stocks, errors)
+
+    # 对缺失项用 Yahoo 元数据回退，
     # 并控制并发，避免一次失败影响整个股票池。
     missing = [x for x in stocks if x.get("n") == x["c"] or
         not x.get("market_cap") or (x["m"] == "A股" and not x.get("float_cap"))]
@@ -219,6 +225,36 @@ def spot_metadata(stocks, errors):
         if failures:
             errors.append(f"Yahoo metadata failures: {failures}/{len(missing)}")
     return float_caps
+
+
+def tencent_names(stocks, errors):
+    query_map = {}
+    for item in stocks:
+        if item["m"] == "A股":
+            key = ("sh" if item["c"].startswith("6") else "sz") + item["c"]
+        elif item["m"] == "港股":
+            key = "hk" + item["c"].zfill(5)
+        else:
+            key = "us" + item["c"].replace("-", ".")
+        query_map[key.lower()] = item
+    keys = list(query_map)
+    failures = 0
+    for start in range(0, len(keys), 50):
+        batch = keys[start:start + 50]
+        try:
+            response = requests.get("https://qt.gtimg.cn/q=" + ",".join(batch),
+                timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+            response.raise_for_status()
+            response.encoding = "gbk"
+            for key, body in re.findall(r'v_([^=]+)="([^"]*)"', response.text):
+                item = query_map.get(key.lower())
+                parts = body.split("~")
+                if item and len(parts) > 1 and parts[1].strip():
+                    item["n"] = parts[1].strip()
+        except Exception:
+            failures += 1
+    if failures:
+        errors.append(f"Tencent name batches failed: {failures}")
 
 
 def find_column(frame, words):
