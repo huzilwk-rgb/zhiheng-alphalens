@@ -105,6 +105,14 @@ def finite(value):
 def load_previous():
     if not OUTPUT.exists():
         return {}
+    try:
+        payload = json.loads(OUTPUT.read_text(encoding="utf-8"))
+        stocks = payload.get("stocks", [])
+        if not isinstance(stocks, list):
+            return {}
+        return {x["c"]: x for x in stocks if isinstance(x, dict) and x.get("c")}
+    except Exception:
+        return {}
 
 
 def apply_name_cache(stocks):
@@ -117,11 +125,6 @@ def apply_name_cache(stocks):
         if name:
             item["name_zh"] = name
             item["n"] = name
-    try:
-        payload = json.loads(OUTPUT.read_text(encoding="utf-8"))
-        return {x["c"]: x for x in payload.get("stocks", [])}
-    except Exception:
-        return {}
 
 
 def price_label(market, price):
@@ -421,7 +424,7 @@ def rescore(stocks):
 
 
 def main():
-    previous = load_previous()
+    previous = load_previous() or {}
     stocks = expanded_base()
     apply_name_cache(stocks)
     for item in stocks:
