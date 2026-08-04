@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -161,7 +162,8 @@ def spot_metadata(stocks, errors):
             frame = loader()
             code_col = find_column(frame, ["代码"])
             name_col = find_column(frame, ["名称"])
-            cap_col = find_column(frame, ["流通", "市值"]) if market == "A股" else None
+            float_col = find_column(frame, ["流通", "市值"])
+            total_col = find_column(frame, ["总", "市值"])
             if code_col is None or name_col is None:
                 raise RuntimeError("metadata columns changed")
             for _, row in frame.iterrows():
@@ -171,12 +173,51 @@ def spot_metadata(stocks, errors):
                 item = by_market[market].get(code) or by_market[market].get(code.lstrip("0"))
                 if item:
                     item["n"] = str(row[name_col]).strip() or item["n"]
-                    if cap_col is not None:
-                        cap = finite(row[cap_col])
+                    if total_col is not None:
+                        cap = finite(row[total_col])
                         if cap:
-                            float_caps[item["c"]] = cap
+                            item["market_cap"] = cap
+                    if float_col is not None:
+                        cap = finite(row[float_col])
+                        if cap:
+                            item["float_cap"] = cap
+                            if market == "A股":
+                                float_caps[item["c"]] = cap
         except Exception as exc:
             errors.append(f"{market} metadata: {type(exc).__name__}")
+    # GitHub 云端偶尔无法访问东方财富。对缺失项用 Yahoo 元数据回退，
+    # 并控制并发，避免一次失败影响整个股票池。
+    missing = [x for x in stocks if x.get("n") == x["c"] or
+        not x.get("market_cap") or (x["m"] == "A股" and not x.get("float_cap"))]
+
+    def load_one(item):
+        info = yf.Ticker(item["yf"]).get_info()
+        name = info.get("longName") or info.get("shortName")
+        total = finite(info.get("marketCap"))
+        float_shares = finite(info.get("floatShares"))
+        shares = finite(info.get("sharesOutstanding"))
+        float_cap = total * float_shares / shares if total and float_shares and shares else None
+        return item, name, total, float_cap
+
+    if missing:
+        failures = 0
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = [pool.submit(load_one, item) for item in missing]
+            for future in as_completed(futures):
+                try:
+                    item, name, total, float_cap = future.result()
+                    if name:
+                        item["n"] = str(name).strip()
+                    if total:
+                        item["market_cap"] = total
+                    if float_cap:
+                        item["float_cap"] = float_cap
+                        if item["m"] == "A股":
+                            float_caps[item["c"]] = float_cap
+                except Exception:
+                    failures += 1
+        if failures:
+            errors.append(f"Yahoo metadata failures: {failures}/{len(missing)}")
     return float_caps
 
 
@@ -251,9 +292,11 @@ def main():
     stocks = expanded_base()
     for item in stocks:
         old = previous.get(item["c"], {})
-        for field in ("p", "chg", "price_date", "fb", "fr", "f20", "margin_date"):
+        for field in ("n", "p", "chg", "price_date", "fb", "fr", "f20",
+                "margin_date", "market_cap", "float_cap"):
             if field in old:
-                item[field] = old[field]
+                if field != "n" or old[field] != item["c"]:
+                    item[field] = old[field]
     errors = []
     float_caps = spot_metadata(stocks, errors)
     update_prices(stocks, errors)
