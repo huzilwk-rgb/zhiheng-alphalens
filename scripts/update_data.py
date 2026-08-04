@@ -119,7 +119,7 @@ def price_label(market, price):
 def update_prices(stocks, errors):
     ticker_map = {item["yf"]: item for item in stocks}
     try:
-        history = yf.download(list(ticker_map), period="7d", interval="1d",
+        history = yf.download(list(ticker_map), period="1y", interval="1d",
             auto_adjust=False, group_by="ticker", threads=True, progress=False,
             timeout=30)
     except Exception as exc:
@@ -138,8 +138,16 @@ def update_prices(stocks, errors):
             if last is None:
                 raise ValueError("no close")
             item["p"] = price_label(item["m"], last)
+            item["price_value"] = round(last, 6)
             item["chg"] = round((last / prev - 1) * 100, 2) if prev else 0
             item["price_date"] = str(close.index[-1].date())
+            if len(close) >= 60:
+                returns = close.pct_change().dropna()
+                item["volatility_60d"] = round(float(returns.iloc[-60:].std()) * (252 ** .5), 6)
+                peak = close.cummax()
+                item["drawdown_1y"] = round(float((close / peak - 1).min()), 6)
+            if len(close) >= 120:
+                item["momentum_6m"] = round(float(last / close.iloc[-120] - 1), 6)
         except Exception as exc:
             errors.append(f'{item["c"]} price: {type(exc).__name__}')
         item.pop("yf", None)
@@ -193,8 +201,11 @@ def spot_metadata(stocks, errors):
 
     # 对缺失项用 Yahoo 元数据回退，
     # 并控制并发，避免一次失败影响整个股票池。
+    fundamental_keys = ("roe", "profit_margin", "debt_to_equity", "revenue_growth",
+        "earnings_growth", "trailing_pe", "price_to_book", "beta")
     missing = [x for x in stocks if x.get("n") == x["c"] or
-        not x.get("market_cap") or (x["m"] == "A股" and not x.get("float_cap"))]
+        not x.get("market_cap") or (x["m"] == "A股" and not x.get("float_cap")) or
+        sum(x.get(key) is not None for key in fundamental_keys) < 5]
 
     def load_one(item):
         info = yf.Ticker(item["yf"]).get_info()
@@ -203,7 +214,18 @@ def spot_metadata(stocks, errors):
         float_shares = finite(info.get("floatShares"))
         shares = finite(info.get("sharesOutstanding"))
         float_cap = total * float_shares / shares if total and float_shares and shares else None
-        return item, name, total, float_cap
+        factors = {
+            "roe": finite(info.get("returnOnEquity")),
+            "profit_margin": finite(info.get("profitMargins")),
+            "debt_to_equity": finite(info.get("debtToEquity")),
+            "revenue_growth": finite(info.get("revenueGrowth")),
+            "earnings_growth": finite(info.get("earningsGrowth")),
+            "trailing_pe": finite(info.get("trailingPE")),
+            "price_to_book": finite(info.get("priceToBook")),
+            "beta": finite(info.get("beta")),
+            "free_cashflow": finite(info.get("freeCashflow")),
+        }
+        return item, name, total, float_cap, factors
 
     if missing:
         failures = 0
@@ -211,7 +233,7 @@ def spot_metadata(stocks, errors):
             futures = [pool.submit(load_one, item) for item in missing]
             for future in as_completed(futures):
                 try:
-                    item, name, total, float_cap = future.result()
+                    item, name, total, float_cap, factors = future.result()
                     if name:
                         item["n"] = str(name).strip()
                     if total:
@@ -220,6 +242,9 @@ def spot_metadata(stocks, errors):
                         item["float_cap"] = float_cap
                         if item["m"] == "A股":
                             float_caps[item["c"]] = float_cap
+                    for key, value in factors.items():
+                        if value is not None:
+                            item[key] = value
                 except Exception:
                     failures += 1
         if failures:
@@ -323,13 +348,74 @@ def update_a_margin(stocks, errors, float_caps):
             item["margin_date"] = margin_date
 
 
+def percentile_scores(stocks, key, higher=True, valid=None):
+    result = {}
+    groups = {}
+    for item in stocks:
+        value = finite(item.get(key))
+        if value is None or (valid and not valid(value)):
+            continue
+        groups.setdefault((item["m"], item["s"]), []).append((value, item["m"] + ":" + item["c"]))
+    for rows in groups.values():
+        rows.sort(key=lambda x: x[0], reverse=not higher)
+        size = len(rows)
+        for rank, (_, identity) in enumerate(rows):
+            # 收缩到 5–95，避免样本内第一/最后被误解为绝对满分或零分。
+            result[identity] = 50.0 if size == 1 else 5 + rank / (size - 1) * 90
+    return result
+
+
+def rescore(stocks):
+    specs = {
+        "roe": (True, None), "profit_margin": (True, None),
+        "debt_to_equity": (False, lambda x: x >= 0),
+        "revenue_growth": (True, None), "earnings_growth": (True, None),
+        "momentum_6m": (True, None),
+        "trailing_pe": (False, lambda x: x > 0),
+        "price_to_book": (False, lambda x: x > 0),
+        "volatility_60d": (False, lambda x: x >= 0),
+        "drawdown_1y": (True, lambda x: x <= 0),
+        "beta": (False, lambda x: x >= 0),
+    }
+    ranks = {key: percentile_scores(stocks, key, higher, valid)
+        for key, (higher, valid) in specs.items()}
+    groups = {
+        "q": ["roe", "profit_margin", "debt_to_equity"],
+        "g": ["revenue_growth", "earnings_growth", "momentum_6m"],
+        "v": ["trailing_pe", "price_to_book"],
+        "r": ["volatility_60d", "drawdown_1y", "beta"],
+    }
+    for item in stocks:
+        identity = item["m"] + ":" + item["c"]
+        present = 0
+        for score_key, factor_keys in groups.items():
+            values = []
+            for factor in factor_keys:
+                if identity in ranks[factor]:
+                    values.append(ranks[factor][identity])
+                    present += 1
+            item[score_key] = round(sum(values) / len(values), 1) if values else 50.0
+        # 融资拥挤只作为A股风险扣分项。
+        if item["m"] == "A股":
+            crowd_penalty = max(0, (finite(item.get("fr")) or 0) - 3) * 2
+            growth_penalty = max(0, (finite(item.get("f20")) or 0) - 10) * .25
+            item["r"] = round(max(0, item["r"] - min(15, crowd_penalty + growth_penalty)), 1)
+        item["score"] = round(item["q"] * .35 + item["g"] * .25 +
+            item["v"] * .2 + item["r"] * .2, 1)
+        item["factor_coverage"] = round(present / len(specs) * 100)
+        item["grade"] = "S" if item["score"] >= 85 else "A" if item["score"] >= 70 else "B"
+
+
 def main():
     previous = load_previous()
     stocks = expanded_base()
     for item in stocks:
         old = previous.get(item["c"], {})
-        for field in ("n", "p", "chg", "price_date", "fb", "fr", "f20",
-                "margin_date", "market_cap", "float_cap"):
+        for field in ("n", "p", "price_value", "chg", "price_date", "fb", "fr", "f20",
+                "margin_date", "market_cap", "float_cap", "roe", "profit_margin",
+                "debt_to_equity", "revenue_growth", "earnings_growth", "trailing_pe",
+                "price_to_book", "beta", "free_cashflow", "momentum_6m",
+                "volatility_60d", "drawdown_1y"):
             if field in old:
                 if field != "n" or old[field] != item["c"]:
                     item[field] = old[field]
@@ -337,6 +423,7 @@ def main():
     float_caps = spot_metadata(stocks, errors)
     update_prices(stocks, errors)
     update_a_margin(stocks, errors, float_caps)
+    rescore(stocks)
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "updated_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds"),
